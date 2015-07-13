@@ -1,14 +1,59 @@
 #!/usr/bin/python3
 
-import sys, sqlite3, subprocess, shutil, os
+import sys, getpass, urllib.request, urllib.error, json, re
 
-# Load STORAGE_ROOT setting from /etc/mailinabox.conf.
-env = { }
-for line in open("/etc/mailinabox.conf"): env.setdefault(*line.strip().split("=", 1))
+def mgmt(cmd, data=None, is_json=False):
+	# The base URL for the management daemon. (Listens on IPv4 only.)
+	mgmt_uri = 'http://127.0.0.1:10222'
 
-# Connect to database.
-conn = sqlite3.connect(env["STORAGE_ROOT"] + "/mail/users.sqlite")
-c = conn.cursor()
+	setup_key_auth(mgmt_uri)
+
+	req = urllib.request.Request(mgmt_uri + cmd, urllib.parse.urlencode(data).encode("utf8") if data else None)
+	try:
+		response = urllib.request.urlopen(req)
+	except urllib.error.HTTPError as e:
+		if e.code == 401:
+			try:
+				print(e.read().decode("utf8"))
+			except:
+				pass
+			print("The management daemon refused access. The API key file may be out of sync. Try 'service mailinabox restart'.", file=sys.stderr)
+		elif hasattr(e, 'read'):
+			print(e.read().decode('utf8'), file=sys.stderr)
+		else:
+			print(e, file=sys.stderr)
+		sys.exit(1)
+	resp = response.read().decode('utf8')
+	if is_json: resp = json.loads(resp)
+	return resp
+
+def read_password():
+    while True:
+        first = getpass.getpass('password: ')
+        if len(first) < 4:
+            print("Passwords must be at least four characters.")
+            continue
+        if re.search(r'[\s]', first):
+            print("Passwords cannot contain spaces.")
+            continue
+        second = getpass.getpass(' (again): ')
+        if first != second:
+            print("Passwords not the same. Try again.")
+            continue
+        break
+    return first
+
+def setup_key_auth(mgmt_uri):
+	key = open('/var/lib/mailinabox/api.key').read().strip()
+
+	auth_handler = urllib.request.HTTPBasicAuthHandler()
+	auth_handler.add_password(
+		realm='Mail-in-a-Box Management Server',
+		uri=mgmt_uri,
+		user=key,
+		passwd='')
+	opener = urllib.request.build_opener(auth_handler)
+	urllib.request.install_opener(opener)
 
 if len(sys.argv) < 2:
 	print("Usage: ")
@@ -16,17 +61,27 @@ if len(sys.argv) < 2:
 	print("  tools/mail.py user add user@domain.com [password]")
 	print("  tools/mail.py user password user@domain.com [password]")
 	print("  tools/mail.py user remove user@domain.com")
+	print("  tools/mail.py user make-admin user@domain.com")
+	print("  tools/mail.py user remove-admin user@domain.com")
+	print("  tools/mail.py user admins (lists admins)")
 	print("  tools/mail.py alias  (lists aliases)")
 	print("  tools/mail.py alias add incoming.name@domain.com sent.to@other.domain.com")
+	print("  tools/mail.py alias add incoming.name@domain.com 'sent.to@other.domain.com, multiple.people@other.domain.com'")
 	print("  tools/mail.py alias remove incoming.name@domain.com")
 	print()
 	print("Removing a mail user does not delete their mail folders on disk. It only prevents IMAP/SMTP login.")
 	print()
 
 elif sys.argv[1] == "user" and len(sys.argv) == 2:
-	c.execute('SELECT email FROM users')
-	for row in c.fetchall():
-		print(row[0])
+	# Dump a list of users, one per line. Mark admins with an asterisk.
+	users = mgmt("/mail/users?format=json", is_json=True)
+	for domain in users:
+		for user in domain["users"]:
+			if user['status'] == 'inactive': continue
+			print(user['email'], end='')
+			if "admin" in user['privileges']:
+				print("*", end='')
+			print()
 
 elif sys.argv[1] == "user" and sys.argv[2] in ("add", "password"):
 	if len(sys.argv) < 5:
@@ -34,72 +89,43 @@ elif sys.argv[1] == "user" and sys.argv[2] in ("add", "password"):
 			email = input("email: ")
 		else:
 			email = sys.argv[3]
-		pw = input("password: ")
+		pw = read_password()
 	else:
 		email, pw = sys.argv[3:5]
 
-	# hash the password
-	pw = subprocess.check_output(["/usr/bin/doveadm", "pw", "-s", "SHA512-CRYPT", "-p", pw]).strip()
-
 	if sys.argv[2] == "add":
-		try:
-			c.execute("INSERT INTO users (email, password) VALUES (?, ?)", (email, pw))
-		except sqlite3.IntegrityError:
-			print("User already exists.")
-			sys.exit(1)
-			
-		conn.commit() # write it before next step
-		
-		# Create the user's INBOX and Spam folders and subscribe them.
-
-		# Check if the mailboxes exist before creating them. When creating a user that had previously
-		# been deleted, the mailboxes will still exist because they are still on disk.
-		existing_mboxes = subprocess.check_output(["doveadm", "mailbox", "list", "-u", email, "-8"]).decode("utf8").split("\n")
-		
-		if "INBOX" not in existing_mboxes: subprocess.check_call(["doveadm", "mailbox", "create", "-u", email, "-s", "INBOX"])
-		if "Spam" not in existing_mboxes: subprocess.check_call(["doveadm", "mailbox", "create", "-u", email, "-s", "Spam"])
-		
-		# Create the user's sieve script to move spam into the Spam folder, and make it owned by mail.
-		maildirstat = os.stat(env["STORAGE_ROOT"] + "/mail/mailboxes")
-		(em_user, em_domain) = email.split("@", 1)
-		user_mail_dir = env["STORAGE_ROOT"] + ("/mail/mailboxes/%s/%s" % (em_domain, em_user))
-		if not os.path.exists(user_mail_dir):
-			os.makedirs(user_mail_dir)
-			os.chown(user_mail_dir, maildirstat.st_uid, maildirstat.st_gid)
-		shutil.copyfile("conf/dovecot_sieve.txt", user_mail_dir + "/.dovecot.sieve")
-		os.chown(user_mail_dir + "/.dovecot.sieve", maildirstat.st_uid, maildirstat.st_gid)
-		
+		print(mgmt("/mail/users/add", { "email": email, "password": pw }))
 	elif sys.argv[2] == "password":
-		c.execute("UPDATE users SET password=? WHERE email=?", (pw, email))
-		if c.rowcount != 1:
-			print("That's not a user.")
-			sys.exit(1)
+		print(mgmt("/mail/users/password", { "email": email, "password": pw }))
 
 elif sys.argv[1] == "user" and sys.argv[2] == "remove" and len(sys.argv) == 4:
-	c.execute("DELETE FROM users WHERE email=?", (sys.argv[3],))
-	if c.rowcount != 1:
-		print("That's not a user.")
-		sys.exit(1)
+	print(mgmt("/mail/users/remove", { "email": sys.argv[3] }))
+
+elif sys.argv[1] == "user" and sys.argv[2] in ("make-admin", "remove-admin") and len(sys.argv) == 4:
+	if sys.argv[2] == "make-admin":
+		action = "add"
+	else:
+		action = "remove"
+	print(mgmt("/mail/users/privileges/" + action, { "email": sys.argv[3], "privilege": "admin" }))
+
+elif sys.argv[1] == "user" and sys.argv[2] == "admins":
+	# Dump a list of admin users.
+	users = mgmt("/mail/users?format=json", is_json=True)
+	for domain in users:
+		for user in domain["users"]:
+			if "admin" in user['privileges']:
+				print(user['email'])
 
 elif sys.argv[1] == "alias" and len(sys.argv) == 2:
-	c.execute('SELECT source, destination FROM aliases')
-	for row in c.fetchall():
-		print(row[0], "=>", row[1])
+	print(mgmt("/mail/aliases"))
 
 elif sys.argv[1] == "alias" and sys.argv[2] == "add" and len(sys.argv) == 5:
-	try:
-		c.execute("INSERT INTO aliases (source, destination) VALUES (?, ?)", (sys.argv[3], sys.argv[4]))
-	except sqlite3.IntegrityError:
-		print("Alias already exists.")
-		sys.exit(1)
+	print(mgmt("/mail/aliases/add", { "source": sys.argv[3], "destination": sys.argv[4] }))
 
 elif sys.argv[1] == "alias" and sys.argv[2] == "remove" and len(sys.argv) == 4:
-	c.execute("DELETE FROM aliases WHERE source=?", (sys.argv[3],))
-	if c.rowcount != 1:
-		print("That's not an alias.")
-		sys.exit(1)
+	print(mgmt("/mail/aliases/remove", { "source": sys.argv[3] }))
 
 else:
 	print("Invalid command-line arguments.")
+	sys.exit(1)
 
-conn.commit()

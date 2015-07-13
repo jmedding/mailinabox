@@ -1,0 +1,15 @@
+# Fail2Ban configuration file for Mail-in-a-Box
+
+# JAILS
+
+[ssh-ddos]
+enabled  = true
+
+[sasl]
+enabled  = true
+
+[dovecot]
+enabled = true
+filter  = dovecotimap
+findtime = 30
+maxretry = 20
